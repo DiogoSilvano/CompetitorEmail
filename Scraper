@@ -1,0 +1,904 @@
+import requests
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from webdriver_manager.chrome import ChromeDriverManager
+from urllib.parse import urlparse
+from openpyxl import load_workbook
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
+import numpy as np
+import time
+import random
+import re
+import os
+import io
+import glob
+from datetime import datetime, timedelta
+
+HEADERS_LIST = [
+    {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    },
+    {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Connection': 'keep-alive',
+    }
+]
+
+SESSION = requests.Session()
+
+# Cosine similarity threshold for TF-IDF deduplication.
+# 0.65 treats same story from different outlets as duplicate.
+SIMILARITY_THRESHOLD = 0.65
+
+
+# =============================================================================
+# DATE / ID HELPERS
+# =============================================================================
+
+def get_week_ending(dt=None):
+    """
+    Return the EmailWeekEnding date string for a Friday-Thursday reporting week.
+    The week is labelled by its closing Thursday.
+    e.g. Fri 2026-02-20 through Thu 2026-02-26 -> "2026-02-26"
+         Fri 2026-02-27 through Thu 2026-03-05 -> "2026-03-05"
+    """
+    if dt is None:
+        dt = datetime.now()
+    # Weekday: Mon=0 ... Thu=3, Fri=4 ... Sun=6
+    # Days until next Thursday (inclusive of today if today is Thursday):
+    # If Friday (4): +6 days to reach Thursday
+    # If Saturday (5): +5 days
+    # If Sunday (6): +4 days
+    # If Monday (0): +3 days
+    # If Tuesday (1): +2 days
+    # If Wednesday (2): +1 day
+    # If Thursday (3): +0 days
+    days_to_thursday = (3 - dt.weekday()) % 7
+    thursday = dt + timedelta(days=days_to_thursday)
+    return thursday.strftime('%d/%m/%Y')
+
+
+def get_scraped_date():
+    """Return today as DD/MM/YYYY  00:00:00 matching Power Automate format."""
+    return datetime.now().strftime('%d/%m/%Y  00:00:00')
+
+
+# =============================================================================
+# URL / TEXT UTILITIES
+# =============================================================================
+
+def get_source_name(url):
+    try:
+        hostname = urlparse(url).hostname or ''
+        name = re.sub(r'^www\.', '', hostname)
+        name = re.sub(r'\.(co\.uk|com|org|net|gov\.uk|org\.uk)$', '', name)
+        name = name.replace('-', ' ').replace('.', ' ')
+        return name.strip().title()
+    except Exception:
+        return ''
+
+
+def normalise_url(url):
+    """Strip query strings and fragments for URL-level duplicate detection."""
+    try:
+        p = urlparse(str(url))
+        return f'{p.scheme}://{p.netloc}{p.path}'.rstrip('/')
+    except Exception:
+        return str(url).strip()
+
+
+def is_binary_text(text):
+    """Return True if text contains too many non-printable / binary characters."""
+    if not text:
+        return True
+    sample = text[:500]
+    bad = sum(1 for c in sample if ord(c) > 127 or (ord(c) < 32 and c not in '\n\r\t'))
+    return (bad / len(sample)) > 0.1
+
+
+def sanitise_str(value):
+    """
+    Remove XML 1.0 illegal characters that corrupt Excel / SharePoint files.
+    These are the characters that cause the 'Repaired Records: String properties' error.
+    Covers: null bytes, C0/C1 control chars, Unicode surrogates, non-characters.
+    """
+    if not isinstance(value, str):
+        return value
+    illegal = re.compile(
+        r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F'   # control characters
+        r'\uD800-\uDFFF'                        # UTF-16 surrogates
+        r'\uFFFE\uFFFF]'                        # non-characters
+    )
+    return illegal.sub('', value).replace('\x00', '')
+
+
+def sanitise_dataframe(df):
+    """Apply sanitise_str to every string cell.
+    Handles pandas >= 2.1 which renamed applymap to map."""
+    result = df.copy()
+    for col in result.select_dtypes(include='object').columns:
+        result[col] = result[col].apply(
+            lambda v: sanitise_str(v) if isinstance(v, str) else v)
+    return result
+
+
+# =============================================================================
+# DATE NORMALISATION
+# =============================================================================
+
+def parse_any_date(value):
+    """
+    Try to parse a date string in any common format.
+    Returns a datetime object or None.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    formats = [
+        '%d/%m/%Y',        # 26/02/2026
+        '%d/%m/%Y  %H:%M:%S',  # 26/02/2026  00:00:00
+        '%Y-%m-%d',        # 2026-02-26
+        '%Y-%m-%d %H:%M:%S',
+        '%m/%d/%Y',
+        '%d-%m-%Y',
+        '%B %d, %Y',
+        '%d %B %Y',
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(value[:len(fmt) + 2], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalise_date_columns(df, columns=('DateScraped', 'EmailWeekEnding')):
+    """
+    Reformat all values in the given columns to dd/MM/yyyy.
+    Values that cannot be parsed are left as-is.
+    """
+    df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            continue
+        def reformat(val):
+            if pd.isna(val) or str(val).strip() == '':
+                return val
+            dt = parse_any_date(str(val))
+            if dt:
+                return dt.strftime('%d/%m/%Y')
+            return val
+        df[col] = df[col].apply(reformat)
+    return df
+
+
+# =============================================================================
+# PDF HANDLING
+# =============================================================================
+
+def is_pdf_url(url):
+    """Detect PDF links by URL extension or Content-Type header (HEAD request)."""
+    if str(url).lower().split('?')[0].endswith('.pdf'):
+        return True
+    try:
+        head = SESSION.head(url, timeout=10, allow_redirects=True)
+        return 'pdf' in head.headers.get('Content-Type', '').lower()
+    except Exception:
+        return False
+
+
+def scrape_pdf(url):
+    """
+    Download a PDF and extract clean text with pdfplumber (must be installed).
+    Install: pip install pdfplumber
+
+    Returns the same dict shape as scrape_article so callers need no special casing.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return {
+            'normalized_url': url, 'title': '', 'text': '',
+            'source_name': get_source_name(url),
+            'accessible': False, 'method': 'pdf',
+            'error': 'pdfplumber not installed -- run: pip install pdfplumber',
+        }
+
+    try:
+        headers = random.choice(HEADERS_LIST)
+        last_err = None
+        r = None
+        for attempt in range(3):
+            try:
+                session = SESSION if attempt == 0 else __import__('requests').Session()
+                r = session.get(url, headers=headers, timeout=30, allow_redirects=True)
+                break
+            except Exception as e:
+                last_err = e
+                __import__('time').sleep(2 ** attempt)
+        if r is None:
+            return {
+                'normalized_url': url, 'title': '', 'text': '',
+                'source_name': get_source_name(url),
+                'accessible': False, 'method': 'pdf',
+                'error': f'Connection failed after 3 attempts: {str(last_err)[:80]}',
+            }
+        if r.status_code != 200:
+            return {
+                'normalized_url': url, 'title': '', 'text': '',
+                'source_name': get_source_name(url),
+                'accessible': False, 'method': 'pdf',
+                'error': f'HTTP {r.status_code}',
+            }
+
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            pages_text = []
+            for page in pdf.pages[:15]:     # cap at 15 pages
+                t = page.extract_text()
+                if t:
+                    pages_text.append(t)
+            full_text = '\n'.join(pages_text).strip()
+
+        if not full_text:
+            return {
+                'normalized_url': url, 'title': '', 'text': '',
+                'source_name': get_source_name(url),
+                'accessible': False, 'method': 'pdf',
+                'error': 'PDF text extraction returned empty',
+            }
+
+        lines = [l.strip() for l in full_text.splitlines() if len(l.strip()) > 10]
+        title = lines[0][:200] if lines else ''
+
+        return {
+            'normalized_url': r.url, 'title': title,
+            'text': full_text[:8000],
+            'source_name': get_source_name(r.url),
+            'accessible': True, 'method': 'pdf', 'error': None,
+        }
+
+    except Exception as e:
+        return {
+            'normalized_url': url, 'title': '', 'text': '',
+            'source_name': get_source_name(url),
+            'accessible': False, 'method': 'pdf',
+            'error': f'PDF error: {str(e)[:80]}',
+        }
+
+
+# =============================================================================
+# HTML SCRAPING
+# =============================================================================
+
+def extract_title(soup):
+    og = soup.find('meta', property='og:title')
+    if og and og.get('content'):
+        return og['content'].strip()
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    h1 = soup.find('h1')
+    if h1:
+        return h1.get_text(strip=True)
+    return ''
+
+
+def extract_text(html):
+    soup = BeautifulSoup(html, 'lxml')
+    title = extract_title(soup)
+    for tag in soup(['script', 'style', 'nav', 'footer', 'header',
+                     'aside', 'form', 'iframe', 'noscript']):
+        tag.decompose()
+    body = (
+        soup.find('article') or
+        soup.find(class_=lambda c: c and any(x in c.lower() for x in
+            ['article-body', 'post-content', 'entry-content',
+             'article-content', 'story-body'])) or
+        soup.find('main') or
+        soup.find('body')
+    )
+    if not body:
+        return title, ''
+    paragraphs = body.find_all('p')
+    text = ' '.join(
+        p.get_text(separator=' ', strip=True)
+        for p in paragraphs
+        if len(p.get_text(strip=True)) > 40
+        and 'cookie' not in p.get_text(strip=True).lower()
+    )
+    if len(text) < 200:
+        text = body.get_text(separator=' ', strip=True)
+    return title, text[:8000]
+
+
+def scrape_with_requests(url):
+    try:
+        time.sleep(random.uniform(1.5, 3.5))
+        headers = random.choice(HEADERS_LIST)
+        r = SESSION.get(url, headers=headers, timeout=20, allow_redirects=True)
+        final_url = r.url
+        if r.status_code == 403: return final_url, '', '', '403'
+        if r.status_code == 429: return final_url, '', '', '429'
+        if r.status_code != 200: return final_url, '', '', f'HTTP {r.status_code}'
+        if r.encoding and r.encoding.lower() == 'iso-8859-1':
+            r.encoding = 'utf-8'
+        title, text = extract_text(r.text)
+        if is_binary_text(text): return final_url, '', '', 'binary_content'
+        if len(text) < 100: return final_url, title, '', 'too_short'
+        return final_url, title, text, None
+    except Exception as e:
+        return url, '', '', f'Connection:{str(e)[:60]}'
+
+
+def scrape_with_selenium(url):
+    driver = None
+    try:
+        options = Options()
+        options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        )
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(30)
+        driver.get(url)
+        time.sleep(random.uniform(3, 5))
+        final_url = driver.current_url
+        for by, selector in [
+            (By.ID, 'accept-cookies'),
+            (By.ID, 'onetrust-accept-btn-handler'),
+            (By.CSS_SELECTOR, '.cookie-accept'),
+            (By.XPATH, "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                       "'abcdefghijklmnopqrstuvwxyz'),'accept all')]"),
+            (By.XPATH, "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                       "'abcdefghijklmnopqrstuvwxyz'),'accept cookies')]"),
+            (By.XPATH, "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                       "'abcdefghijklmnopqrstuvwxyz'),'agree')]"),
+        ]:
+            try:
+                btn = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((by, selector)))
+                btn.click()
+                time.sleep(2)
+                break
+            except Exception:
+                pass
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+        time.sleep(2)
+        title = driver.execute_script("""
+            const og = document.querySelector('meta[property="og:title"]');
+            if (og) return og.content;
+            const h1 = document.querySelector('h1');
+            if (h1) return h1.innerText.trim();
+            return document.title;
+        """)
+        text = driver.execute_script("""
+            const selectors = ['article p', 'main p',
+                '[class*="content"] p', '[class*="article"] p', 'p'];
+            for (const sel of selectors) {
+                const paras = Array.from(document.querySelectorAll(sel))
+                    .map(p => p.innerText.trim())
+                    .filter(t => t.length > 40 && !t.toLowerCase().includes('cookie'));
+                if (paras.length > 3) return paras.slice(0, 100).join(' ');
+            }
+            return '';
+        """)
+        text = (text or '')[:8000]
+        if len(text) < 100:
+            return final_url, title or '', '', 'too_short after browser render'
+        return final_url, title or '', text, None
+    except Exception as e:
+        return url, '', '', f'Selenium error: {str(e)[:80]}'
+    finally:
+        if driver:
+            driver.quit()
+
+
+def scrape_article(url):
+    """
+    Route URL to the correct scraper:
+    - PDFs    -> pdfplumber extractor
+    - HTML    -> requests, falling back to Selenium
+
+    Always returns dict with keys:
+        normalized_url, title, text, source_name, accessible, method, error
+    """
+    if is_pdf_url(url):
+        print(f'   [PDF] Detected — extracting with pdfplumber')
+        return scrape_pdf(url)
+
+    final_url, title, text, err = scrape_with_requests(url)
+    if text:
+        return {
+            'normalized_url': final_url, 'title': title, 'text': text,
+            'source_name': get_source_name(final_url),
+            'accessible': True, 'method': 'requests', 'error': None,
+        }
+    if any(x in str(err) for x in ('403', '429', 'too_short', 'Connection', 'binary_content')):
+        print(f'   [WARN] requests failed ({err[:40]}), trying Selenium...')
+        final_url2, title2, text2, err2 = scrape_with_selenium(url)
+        if text2:
+            return {
+                'normalized_url': final_url2, 'title': title2, 'text': text2,
+                'source_name': get_source_name(final_url2),
+                'accessible': True, 'method': 'selenium', 'error': None,
+            }
+        return {
+            'normalized_url': final_url2, 'title': '', 'text': '',
+            'source_name': get_source_name(final_url2),
+            'accessible': False, 'method': 'selenium', 'error': err2,
+        }
+    return {
+        'normalized_url': final_url, 'title': '', 'text': '',
+        'source_name': get_source_name(final_url),
+        'accessible': False, 'method': 'requests', 'error': err,
+    }
+
+
+# =============================================================================
+# RSS FILE LOADER
+# =============================================================================
+
+def load_rss_file(rss_folder):
+    """Load the most recently modified weekly RSS_Articles_W*.xlsx file."""
+    pattern = os.path.join(rss_folder, 'RSS_Articles_W*.xlsx')
+    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if not files:
+        print(f'INFO: No weekly RSS file found in: {rss_folder}')
+        return pd.DataFrame()
+    latest = files[0]
+    print(f'Loading RSS file: {os.path.basename(latest)}')
+    df = pd.read_excel(latest, engine='openpyxl')
+    print(f'  {len(df)} RSS articles loaded\n')
+    return df
+
+
+# =============================================================================
+# DEDUPLICATION
+# =============================================================================
+
+def extract_entities(title):
+    """
+    Extract capitalised words as a proxy for named entities (companies, brands, people).
+    Used for title-level same-story detection.
+    """
+    stop = {
+        'the','and','for','from','with','that','this','are','was','has','have',
+        'its','not','but','can','will','all','new','top','how','why','what',
+        'when','who','set','get','now','into','after','over','more','than',
+        'say','says','said','just','also','both','some','their','would',
+    }
+    title = re.sub(r'[^\w\s]', ' ', title)
+    entities = set()
+    for w in title.split():
+        if len(w) >= 3 and w[0].isupper() and w.lower() not in stop:
+            entities.add(w.lower())
+    return entities
+
+
+def titles_are_same_story(t1, t2, min_shared=2):
+    """Return True if two titles share enough named entities to be the same story."""
+    shared = extract_entities(t1) & extract_entities(t2)
+    return len(shared) >= min_shared
+
+
+def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
+    """
+    Three-stage deduplication of RSS articles against the existing DB.
+
+    Stage 1 -- URL match: normalised URL comparison (strips query strings).
+    Stage 2 -- Title entity overlap: shared named entities (companies/brands)
+               in titles catches "same story, different angle" coverage.
+    Stage 3 -- TF-IDF cosine similarity on full article text (threshold 0.4).
+
+    DB rows always win. RSS rows that match on any stage are removed.
+    Console output identifies each removed article and the matching DB row number.
+    """
+    if rss_df.empty:
+        return rss_df, []
+
+    removed_log = []
+    keep_mask   = [True] * len(rss_df)
+
+    # Build DB URL set
+    db_urls = set()
+    for col in ['NormalizedURL', 'ArticleURL']:
+        if col in db_df.columns:
+            db_urls.update(
+                normalise_url(u)
+                for u in db_df[col].dropna().astype(str)
+                if str(u).startswith('http')
+            )
+
+    db_df = db_df.copy()
+    db_df['_combined'] = (
+        db_df.get('Title', pd.Series(dtype=str)).fillna('') + ' ' +
+        db_df.get('Full_Article_Text', pd.Series(dtype=str)).fillna('')
+    ).str.strip()
+    db_df['_title'] = db_df.get('Title', pd.Series(dtype=str)).fillna('')
+    db_text_df = db_df[db_df['_combined'].str.len() > 50].reset_index(drop=True)
+
+    rss_df = rss_df.copy()
+    rss_df['_combined'] = (
+        rss_df.get('Title', pd.Series(dtype=str)).fillna('') + ' ' +
+        rss_df.get('Full_Article_Text', pd.Series(dtype=str)).fillna('')
+    ).str.strip()
+    rss_df['_title'] = rss_df.get('Title', pd.Series(dtype=str)).fillna('')
+
+    print('-' * 55)
+    print('DEDUPLICATION REPORT')
+    print('-' * 55)
+
+    def log_removal(stage, score, rss_row, match_title, match_row):
+        removed_log.append({
+            'stage': stage, 'score': score,
+            'rss_title': rss_row.get('Title', ''),
+            'rss_url':   rss_row.get('NormalizedURL', ''),
+            'match_title': match_title, 'match_row': match_row,
+        })
+        label = f'[{stage}]' if stage == 'URL match' else f'[{stage} {score}]'
+        print(f'  ❌ {label}  "{str(rss_row.get("Title", ""))[:60]}"'  )
+        print(f'           -> Matches row {match_row}: "{str(match_title)[:60]}"'  )
+
+    # ── Stage 1: URL match ─────────────────────────────────────────────────
+    url_removed = 0
+    for i, row in rss_df.iterrows():
+        norm = normalise_url(row.get('NormalizedURL', '') or row.get('ArticleURL', ''))
+        if norm not in db_urls:
+            continue
+        keep_mask[i] = False
+        url_removed += 1
+        db_match = pd.DataFrame()
+        if 'NormalizedURL' in db_df.columns:
+            db_match = db_df[db_df['NormalizedURL'].apply(normalise_url) == norm]
+        if db_match.empty and 'ArticleURL' in db_df.columns:
+            db_match = db_df[db_df['ArticleURL'].apply(normalise_url) == norm]
+        match_row   = (db_match.index[0] + output_row_offset + 2) if not db_match.empty else '?'
+        match_title = db_match.iloc[0].get('Title', 'Unknown') if not db_match.empty else 'Unknown'
+        log_removal('URL match', 1.0, row, match_title, match_row)
+
+    print(f'\n  Stage 1 (URL): {url_removed} removed\n')
+
+    # ── Stage 2: Title entity overlap ──────────────────────────────────────
+    remaining = [i for i, k in enumerate(keep_mask) if k]
+    entity_removed = 0
+
+    db_titles = db_text_df['_title'].tolist()
+
+    for orig_i in remaining:
+        rss_title = rss_df.iloc[orig_i]['_title']
+        for db_idx, db_title in enumerate(db_titles):
+            if titles_are_same_story(rss_title, db_title, min_shared=2):
+                keep_mask[orig_i] = False
+                entity_removed += 1
+                match_row   = db_idx + output_row_offset + 2
+                match_title = db_titles[db_idx]
+                shared = extract_entities(rss_title) & extract_entities(db_title)
+                log_removal('Title entities', f'shared={list(shared)[:3]}',
+                            rss_df.iloc[orig_i], match_title, match_row)
+                break
+
+    print(f'  Stage 2 (Title entities): {entity_removed} removed\n')
+
+    # ── Stage 3: TF-IDF full text ──────────────────────────────────────────
+    remaining = [i for i, k in enumerate(keep_mask) if k]
+    tfidf_removed = 0
+
+    if remaining and not db_text_df.empty:
+        remaining_rss = rss_df.iloc[remaining].reset_index(drop=True)
+        rss_texts = remaining_rss['_combined'].tolist()
+        db_texts  = db_text_df['_combined'].tolist()
+
+        vec    = TfidfVectorizer(max_features=5000, stop_words='english', ngram_range=(1, 2))
+        mat    = vec.fit_transform(db_texts + rss_texts)
+        scores = cosine_similarity(mat[len(db_texts):], mat[:len(db_texts)])
+
+        for j, orig_i in enumerate(remaining):
+            best_idx   = int(scores[j].argmax())
+            best_score = float(scores[j][best_idx])
+            if best_score < SIMILARITY_THRESHOLD:
+                continue
+            keep_mask[orig_i] = False
+            tfidf_removed += 1
+            match_row   = best_idx + output_row_offset + 2
+            match_title = db_text_df.iloc[best_idx].get('Title', 'Unknown')
+            log_removal('TF-IDF', round(best_score, 3),
+                        rss_df.iloc[orig_i], match_title, match_row)
+
+    print(f'  Stage 3 (TF-IDF): {tfidf_removed} removed\n')
+
+    unique_rss = rss_df[keep_mask].copy()
+    # Drop internal helper columns
+    for col in ['_combined', '_title']:
+        if col in unique_rss.columns:
+            unique_rss = unique_rss.drop(columns=[col])
+
+    print(f'  Total removed: {url_removed + entity_removed + tfidf_removed}')
+    print(f'  Unique kept  : {len(unique_rss)}')
+    print('-' * 55 + '\n')
+    return unique_rss, removed_log
+
+# =============================================================================
+# EXCEL WRITER
+# =============================================================================
+
+def rewrite_excel_table(output_path, df):
+    """
+    Write df to the named Excel table 'ArticlesTable' in sheet 'Articles'.
+    Strategy: write a clean new sheet via ExcelWriter (which never corrupts),
+    then open with openpyxl only to attach/rename the table definition.
+    This avoids the delete-rows + append pattern that desynchronises table refs.
+    """
+    SHEET_NAME  = 'Articles'
+    TABLE_NAME  = 'ArticlesTable'
+    TABLE_STYLE = 'TableStyleMedium9'
+
+    import tempfile, shutil
+
+    # ── Step 1: write clean data to a temp file ──────────────────────────────
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(tmp_fd)
+
+    try:
+        with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name=SHEET_NAME)
+
+        # ── Step 2: open temp file and add/update the table definition ────────
+        wb = load_workbook(tmp_path)
+        ws = wb[SHEET_NAME]
+
+        n_rows = len(df)
+        n_cols = len(df.columns)
+        ref = f'A1:{get_column_letter(n_cols)}{n_rows + 1}'
+
+        # Remove any auto-generated table openpyxl may have added
+        for tname in list(ws.tables.keys()):
+            del ws.tables[tname]
+
+        tab = Table(displayName=TABLE_NAME, ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(
+            name=TABLE_STYLE, showFirstColumn=False, showLastColumn=False,
+            showRowStripes=True, showColumnStripes=False)
+        ws.add_table(tab)
+
+        wb.save(tmp_path)
+        wb.close()
+
+        # ── Step 3: atomically replace the output file ────────────────────────
+        shutil.move(tmp_path, output_path)
+        print(f'Written {n_rows} rows to {os.path.basename(output_path)}')
+
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    DATA_DIR   = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\data'
+    OUTPUT_DIR = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\output'
+    RSS_DIR    = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\RSS Parser\output'
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    input_file  = os.path.join(DATA_DIR,   'Competitor_Email_DB.xlsx')
+    output_path = os.path.join(OUTPUT_DIR, 'Competitor_Email_DB.xlsx')
+
+    if not os.path.exists(input_file):
+        print(f'ERROR: File not found: {input_file}')
+        input('Press Enter to exit...')
+        return
+
+    # =========================================================================
+    # STEP 1: Scrape pending email links
+    # =========================================================================
+    print('=' * 55)
+    print('STEP 1: Scraping email newsletter links')
+    print('=' * 55)
+
+    # Always read Pending rows from the input file (Competitor_Email_DB.xlsx in /data).
+    # Power Automate writes new Pending rows there. The output file only holds
+    # already-processed rows and is used later for dedup comparison.
+    print(f'Reading from: {os.path.basename(input_file)}')
+    try:
+        df = pd.read_excel(input_file, sheet_name='Articles', engine='openpyxl')
+    except Exception:
+        df = pd.read_excel(input_file, engine='openpyxl')
+
+    for col in ['NormalizedURL', 'Title', 'Full_Article_Text',
+                'SourceName', 'Status', 'EmailWeekEnding', 'DateScraped']:
+        if col not in df.columns:
+            df[col] = ''
+        df[col] = df[col].astype(object)
+
+    week_ending  = get_week_ending()
+    scraped_date = get_scraped_date()
+
+    print(f'Total rows  : {len(df)}')
+    print(f'EmailWeekEnding : {week_ending}')
+    print(f'DateScraped : {scraped_date}')
+
+    # Diagnostic: show what Status values exist in the file
+    status_counts = df['Status'].value_counts(dropna=False).to_dict()
+    print(f'Status breakdown: {status_counts}')
+
+    # Strip whitespace from Status — Power Automate sometimes adds trailing spaces
+    df['Status'] = df['Status'].astype(str).str.strip()
+
+    pending = df[df['Status'] == 'Pending']
+    success_email = failed_email = 0
+    print(f'Pending rows: {len(pending)}\n')
+
+    total_pending = len(pending)
+    for pending_num, (i, row) in enumerate(pending.iterrows(), start=1):
+        url = str(row.get('ArticleURL', '')).strip()
+        if not url or url.lower() == 'nan':
+            df.at[i, 'Status'] = 'Skipped'
+            continue
+
+        print(f'[{pending_num}/{total_pending}] {url[:90]}')
+        result = scrape_article(url)
+
+        if result['accessible']:
+            df.at[i, 'NormalizedURL']     = result['normalized_url']
+            df.at[i, 'Title']             = result['title']
+            df.at[i, 'Full_Article_Text'] = result['text']
+            df.at[i, 'SourceName']        = result['source_name']
+            df.at[i, 'Status']            = 'Analysed'
+            df.at[i, 'EmailWeekEnding']          = week_ending
+            df.at[i, 'DateScraped']       = scraped_date
+            print(f'   OK [{result["method"]}] {str(result["title"])[:70]}')
+            success_email += 1
+        else:
+            df.at[i, 'NormalizedURL'] = result['normalized_url']
+            df.at[i, 'SourceName']    = result['source_name']
+            df.at[i, 'Status']        = 'Failed'
+            print(f'   FAIL: {result["error"]}')
+            failed_email += 1
+
+    print(f'\nEmail scrape done -- {success_email} success, {failed_email} failed\n')
+
+    # =========================================================================
+    # STEP 2: Load RSS file
+    # =========================================================================
+    print('=' * 55)
+    print('STEP 2: Loading RSS articles')
+    print('=' * 55)
+
+    rss_df = load_rss_file(RSS_DIR)
+
+    # =========================================================================
+    # STEP 3: Deduplicate RSS against DB
+    # =========================================================================
+    print('=' * 55)
+    print('STEP 3: Deduplicating RSS against email DB')
+    print('=' * 55 + '\n')
+
+    try:
+        existing_output_df = pd.read_excel(
+            output_path, sheet_name='Articles', engine='openpyxl')
+    except Exception:
+        existing_output_df = pd.DataFrame()
+
+    newly_analysed = df[df['Status'] == 'Analysed'].copy()
+    db_for_dedup   = pd.concat(
+        [existing_output_df, newly_analysed], ignore_index=True
+    ) if not existing_output_df.empty else newly_analysed
+
+    if not rss_df.empty:
+        # Deduplicate within the RSS file itself first (same story across multiple pulls)
+        url_col_rss = 'NormalizedURL' if 'NormalizedURL' in rss_df.columns else 'ArticleURL'
+        before = len(rss_df)
+        rss_df = rss_df.drop_duplicates(subset=[url_col_rss], keep='first').reset_index(drop=True)
+        dupes_within = before - len(rss_df)
+        if dupes_within:
+            print(f'  Removed {dupes_within} duplicate URLs within RSS file\n')
+        unique_rss, removed_log = deduplicate_rss_against_db(
+            rss_df, db_for_dedup, len(existing_output_df))
+    else:
+        unique_rss, removed_log = pd.DataFrame(), []
+        print('No RSS articles to deduplicate\n')
+
+    # =========================================================================
+    # STEP 4: Build final output and save
+    # =========================================================================
+    print('=' * 55)
+    print('STEP 4: Writing output')
+    print('=' * 55)
+
+    db_columns = list(df.columns)
+    if not unique_rss.empty:
+        for col in db_columns:
+            if col not in unique_rss.columns:
+                unique_rss[col] = ''
+        unique_rss = unique_rss[db_columns]
+
+    # Combine all parts
+    parts     = [p for p in [existing_output_df, newly_analysed, unique_rss] if not p.empty]
+    output_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    # Final dedup pass: drop any duplicate URLs across the whole output.
+    # Priority: keep email DB rows (SourceEmail is empty or not 'RSS - ...') over RSS rows.
+    # Sort so email rows come first, then drop duplicate NormalizedURL keeping first.
+    if not output_df.empty:
+        def is_rss_row(source):
+            s = str(source).strip().lower()
+            return s.startswith('rss')
+
+        output_df['_is_rss'] = output_df.get('SourceEmail', pd.Series(dtype=str)).apply(is_rss_row)
+        # Sort: email rows (False) before RSS rows (True) so email wins on dedup
+        output_df = output_df.sort_values('_is_rss', ascending=True, kind='stable')
+        output_df = output_df.drop(columns=['_is_rss'])
+
+        # Dedup on NormalizedURL (covers both email and RSS rows)
+        url_col_out = 'NormalizedURL' if 'NormalizedURL' in output_df.columns else 'ArticleURL'
+        before = len(output_df)
+        output_df = output_df.drop_duplicates(subset=[url_col_out], keep='first')
+        dupes_removed = before - len(output_df)
+        if dupes_removed:
+            print(f'  Final dedup pass removed {dupes_removed} duplicate URL(s) from output')
+
+        output_df = output_df.reset_index(drop=True)
+
+    if 'EmailWeekEnding' not in output_df.columns:
+        output_df['EmailWeekEnding'] = ''
+
+    # Normalise date columns to dd/MM/yyyy before writing
+    output_df = normalise_date_columns(output_df)
+
+    # Sanitise all strings before writing -- prevents Excel / SharePoint corruption
+    output_df = sanitise_dataframe(output_df)
+    rewrite_excel_table(output_path, output_df)
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    print('\n' + '=' * 55)
+    print('SUMMARY')
+    print('=' * 55)
+    print(f'Email scraped       : {success_email} OK, {failed_email} failed')
+    print(f'RSS unique added    : {len(unique_rss)}')
+    print(f'RSS duplicates out  : {len(removed_log)}')
+    print(f'Total rows in file  : {len(output_df)}')
+    print(f'Output              : {output_path}')
+
+    if removed_log:
+        print('\nRemoved RSS articles detail:')
+        for entry in removed_log:
+            print(f'  [{entry["stage"]} | score={entry["score"]}]')
+            print(f'    RSS  : {str(entry["rss_title"])[:70]}')
+            print(f'    Match: Row {entry["match_row"]} -- {str(entry["match_title"])[:70]}')
+
+    input('\nPress Enter to exit...')
+
+
+if __name__ == '__main__':
+    main()
