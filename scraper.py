@@ -48,6 +48,10 @@ SESSION = requests.Session()
 # 0.65 treats same story from different outlets as duplicate.
 SIMILARITY_THRESHOLD = 0.65
 
+# Shared Selenium driver — created once on first need, reused for all subsequent
+# Selenium fallbacks, and shut down in main()'s finally block.
+_shared_driver = None
+
 
 # =============================================================================
 # DATE / ID HELPERS
@@ -166,7 +170,7 @@ def parse_any_date(value):
     ]
     for fmt in formats:
         try:
-            return datetime.strptime(value[:len(fmt) + 2], fmt)
+            return datetime.strptime(value, fmt)
         except ValueError:
             continue
     return None
@@ -197,9 +201,15 @@ def normalise_date_columns(df, columns=('DateScraped', 'EmailWeekEnding')):
 # =============================================================================
 
 def is_pdf_url(url):
-    """Detect PDF links by URL extension or Content-Type header (HEAD request)."""
-    if str(url).lower().split('?')[0].endswith('.pdf'):
+    """Detect PDF links by URL extension or Content-Type header (HEAD request).
+    HEAD request is only made when the extension is absent or ambiguous."""
+    path = urlparse(str(url)).path.lower()
+    if path.endswith('.pdf'):
         return True
+    known_non_pdf = ('.html', '.htm', '.php', '.asp', '.aspx', '.xml', '.json', '.txt')
+    if any(path.endswith(ext) for ext in known_non_pdf):
+        return False
+    # Extension absent or ambiguous — fall back to a HEAD request
     try:
         head = SESSION.head(url, timeout=10, allow_redirects=True)
         return 'pdf' in head.headers.get('Content-Type', '').lower()
@@ -230,12 +240,12 @@ def scrape_pdf(url):
         r = None
         for attempt in range(3):
             try:
-                session = SESSION if attempt == 0 else __import__('requests').Session()
+                session = SESSION if attempt == 0 else requests.Session()
                 r = session.get(url, headers=headers, timeout=30, allow_redirects=True)
                 break
             except Exception as e:
                 last_err = e
-                __import__('time').sleep(2 ** attempt)
+                time.sleep(2 ** attempt)
         if r is None:
             return {
                 'normalized_url': url, 'title': '', 'text': '',
@@ -349,9 +359,10 @@ def scrape_with_requests(url):
         return url, '', '', f'Connection:{str(e)[:60]}'
 
 
-def scrape_with_selenium(url):
-    driver = None
-    try:
+def _get_or_create_driver():
+    """Return the shared Selenium driver, creating it on first call."""
+    global _shared_driver
+    if _shared_driver is None:
         options = Options()
         options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
@@ -364,8 +375,33 @@ def scrape_with_selenium(url):
             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         )
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(30)
+        _shared_driver = webdriver.Chrome(service=service, options=options)
+        _shared_driver.set_page_load_timeout(30)
+    return _shared_driver
+
+
+def _shutdown_driver():
+    """Quit and discard the shared Selenium driver if it exists."""
+    global _shared_driver
+    if _shared_driver is not None:
+        try:
+            _shared_driver.quit()
+        except Exception:
+            pass
+        _shared_driver = None
+
+
+def scrape_with_selenium(url, driver=None):
+    """Scrape a URL using Selenium.
+
+    If *driver* is supplied the caller owns its lifecycle (no quit on exit).
+    If *driver* is None a temporary single-use driver is created and quit after use.
+    """
+    owns_driver = driver is None
+    if owns_driver:
+        driver = _get_or_create_driver()
+
+    try:
         driver.get(url)
         time.sleep(random.uniform(3, 5))
         final_url = driver.current_url
@@ -415,8 +451,11 @@ def scrape_with_selenium(url):
     except Exception as e:
         return url, '', '', f'Selenium error: {str(e)[:80]}'
     finally:
-        if driver:
-            driver.quit()
+        if owns_driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def scrape_article(url):
@@ -441,7 +480,8 @@ def scrape_article(url):
         }
     if any(x in str(err) for x in ('403', '429', 'too_short', 'Connection', 'binary_content')):
         print(f'   [WARN] requests failed ({err[:40]}), trying Selenium...')
-        final_url2, title2, text2, err2 = scrape_with_selenium(url)
+        final_url2, title2, text2, err2 = scrape_with_selenium(
+            url, driver=_get_or_create_driver())
         if text2:
             return {
                 'normalized_url': final_url2, 'title': title2, 'text': text2,
@@ -501,29 +541,35 @@ def extract_entities(title):
     return entities
 
 
-def titles_are_same_story(t1, t2, min_shared=2):
-    """Return True if two titles share enough named entities to be the same story."""
-    shared = extract_entities(t1) & extract_entities(t2)
-    return len(shared) >= min_shared
+def _prompt_keep_article(stage_label, rss_title, match_row, match_title, detail):
+    """Prompt the user to decide whether to keep a potential duplicate article.
+    Returns True to keep, False to remove. Defaults to remove on EOFError (non-interactive)."""
+    print(f'\n  ⚠  Potential duplicate [{stage_label} | {detail}]:')
+    print(f'     RSS  : "{str(rss_title)[:80]}"')
+    print(f'     Match: Row {match_row} -- "{str(match_title)[:80]}"')
+    try:
+        answer = input('     Keep this article? [y/N]: ').strip().lower()
+    except EOFError:
+        answer = ''   # non-interactive environment: default to remove
+    return answer in ('y', 'yes')
 
 
 def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
     """
     Three-stage deduplication of RSS articles against the existing DB.
 
-    Stage 1 -- URL match: normalised URL comparison (strips query strings).
-    Stage 2 -- Title entity overlap: shared named entities (companies/brands)
-               in titles catches "same story, different angle" coverage.
-    Stage 3 -- TF-IDF cosine similarity on full article text (threshold 0.4).
+    Stage 1 -- URL match: normalised URL comparison (strips query strings). Silent.
+    Stage 2 -- Title entity overlap: shared named entities in titles. Interactive.
+    Stage 3 -- TF-IDF cosine similarity on full article text. Interactive.
 
-    DB rows always win. RSS rows that match on any stage are removed.
+    DB rows always win. The user is prompted before removing any Stage 2/3 matches.
     Console output identifies each removed article and the matching DB row number.
     """
     if rss_df.empty:
         return rss_df, []
 
     removed_log = []
-    keep_mask   = [True] * len(rss_df)
+    keep_mask   = pd.Series(True, index=rss_df.index)
 
     # Build DB URL set
     db_urls = set()
@@ -562,10 +608,10 @@ def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
             'match_title': match_title, 'match_row': match_row,
         })
         label = f'[{stage}]' if stage == 'URL match' else f'[{stage} {score}]'
-        print(f'  ❌ {label}  "{str(rss_row.get("Title", ""))[:60]}"'  )
-        print(f'           -> Matches row {match_row}: "{str(match_title)[:60]}"'  )
+        print(f'  ❌ {label}  "{str(rss_row.get("Title", ""))[:60]}"')
+        print(f'           -> Matches row {match_row}: "{str(match_title)[:60]}"')
 
-    # ── Stage 1: URL match ─────────────────────────────────────────────────
+    # ── Stage 1: URL match (silent) ────────────────────────────────────────
     url_removed = 0
     for i, row in rss_df.iterrows():
         norm = normalise_url(row.get('NormalizedURL', '') or row.get('ArticleURL', ''))
@@ -584,33 +630,45 @@ def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
 
     print(f'\n  Stage 1 (URL): {url_removed} removed\n')
 
-    # ── Stage 2: Title entity overlap ──────────────────────────────────────
-    remaining = [i for i, k in enumerate(keep_mask) if k]
+    # ── Stage 2: Title entity overlap (interactive) ────────────────────────
+    remaining = [i for i in rss_df.index if keep_mask[i]]
     entity_removed = 0
 
     db_titles = db_text_df['_title'].tolist()
+    # Pre-compute entity sets for all DB titles once (avoids O(D×R) recomputation)
+    db_entity_sets = [extract_entities(t) for t in db_titles]
 
     for orig_i in remaining:
-        rss_title = rss_df.iloc[orig_i]['_title']
-        for db_idx, db_title in enumerate(db_titles):
-            if titles_are_same_story(rss_title, db_title, min_shared=2):
+        rss_title = rss_df.at[orig_i, '_title']
+        rss_entities = extract_entities(rss_title)
+        for db_idx, (db_title, db_entities) in enumerate(zip(db_titles, db_entity_sets)):
+            shared = rss_entities & db_entities
+            if len(shared) < 2:
+                continue
+            match_row   = db_idx + output_row_offset + 2
+            match_title = db_titles[db_idx]
+            keep = _prompt_keep_article(
+                stage_label='Title entities',
+                rss_title=rss_title,
+                match_row=match_row,
+                match_title=match_title,
+                detail=f'shared={sorted(shared)[:3]}',
+            )
+            if not keep:
                 keep_mask[orig_i] = False
                 entity_removed += 1
-                match_row   = db_idx + output_row_offset + 2
-                match_title = db_titles[db_idx]
-                shared = extract_entities(rss_title) & extract_entities(db_title)
-                log_removal('Title entities', f'shared={list(shared)[:3]}',
-                            rss_df.iloc[orig_i], match_title, match_row)
-                break
+                log_removal('Title entities', f'shared={sorted(list(shared)[:3])}',
+                            rss_df.loc[orig_i], match_title, match_row)
+            break  # stop checking other db titles for this article
 
     print(f'  Stage 2 (Title entities): {entity_removed} removed\n')
 
-    # ── Stage 3: TF-IDF full text ──────────────────────────────────────────
-    remaining = [i for i, k in enumerate(keep_mask) if k]
+    # ── Stage 3: TF-IDF full text (interactive) ───────────────────────────
+    remaining = [i for i in rss_df.index if keep_mask[i]]
     tfidf_removed = 0
 
     if remaining and not db_text_df.empty:
-        remaining_rss = rss_df.iloc[remaining].reset_index(drop=True)
+        remaining_rss = rss_df.loc[remaining].reset_index(drop=True)
         rss_texts = remaining_rss['_combined'].tolist()
         db_texts  = db_text_df['_combined'].tolist()
 
@@ -623,12 +681,21 @@ def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
             best_score = float(scores[j][best_idx])
             if best_score < SIMILARITY_THRESHOLD:
                 continue
-            keep_mask[orig_i] = False
-            tfidf_removed += 1
             match_row   = best_idx + output_row_offset + 2
             match_title = db_text_df.iloc[best_idx].get('Title', 'Unknown')
-            log_removal('TF-IDF', round(best_score, 3),
-                        rss_df.iloc[orig_i], match_title, match_row)
+            rss_title   = rss_df.at[orig_i, '_title']
+            keep = _prompt_keep_article(
+                stage_label='TF-IDF similarity',
+                rss_title=rss_title,
+                match_row=match_row,
+                match_title=match_title,
+                detail=f'score={best_score:.3f}',
+            )
+            if not keep:
+                keep_mask[orig_i] = False
+                tfidf_removed += 1
+                log_removal('TF-IDF', round(best_score, 3),
+                            rss_df.loc[orig_i], match_title, match_row)
 
     print(f'  Stage 3 (TF-IDF): {tfidf_removed} removed\n')
 
@@ -758,31 +825,34 @@ def main():
     print(f'Pending rows: {len(pending)}\n')
 
     total_pending = len(pending)
-    for pending_num, (i, row) in enumerate(pending.iterrows(), start=1):
-        url = str(row.get('ArticleURL', '')).strip()
-        if not url or url.lower() == 'nan':
-            df.at[i, 'Status'] = 'Skipped'
-            continue
+    try:
+        for pending_num, (i, row) in enumerate(pending.iterrows(), start=1):
+            url = str(row.get('ArticleURL', '')).strip()
+            if not url or url.lower() == 'nan':
+                df.at[i, 'Status'] = 'Skipped'
+                continue
 
-        print(f'[{pending_num}/{total_pending}] {url[:90]}')
-        result = scrape_article(url)
+            print(f'[{pending_num}/{total_pending}] {url[:90]}')
+            result = scrape_article(url)
 
-        if result['accessible']:
-            df.at[i, 'NormalizedURL']     = result['normalized_url']
-            df.at[i, 'Title']             = result['title']
-            df.at[i, 'Full_Article_Text'] = result['text']
-            df.at[i, 'SourceName']        = result['source_name']
-            df.at[i, 'Status']            = 'Analysed'
-            df.at[i, 'EmailWeekEnding']          = week_ending
-            df.at[i, 'DateScraped']       = scraped_date
-            print(f'   OK [{result["method"]}] {str(result["title"])[:70]}')
-            success_email += 1
-        else:
-            df.at[i, 'NormalizedURL'] = result['normalized_url']
-            df.at[i, 'SourceName']    = result['source_name']
-            df.at[i, 'Status']        = 'Failed'
-            print(f'   FAIL: {result["error"]}')
-            failed_email += 1
+            if result['accessible']:
+                df.at[i, 'NormalizedURL']     = result['normalized_url']
+                df.at[i, 'Title']             = result['title']
+                df.at[i, 'Full_Article_Text'] = result['text']
+                df.at[i, 'SourceName']        = result['source_name']
+                df.at[i, 'Status']            = 'Analysed'
+                df.at[i, 'EmailWeekEnding']   = week_ending
+                df.at[i, 'DateScraped']       = scraped_date
+                print(f'   OK [{result["method"]}] {str(result["title"])[:70]}')
+                success_email += 1
+            else:
+                df.at[i, 'NormalizedURL'] = result['normalized_url']
+                df.at[i, 'SourceName']    = result['source_name']
+                df.at[i, 'Status']        = 'Failed'
+                print(f'   FAIL: {result["error"]}')
+                failed_email += 1
+    finally:
+        _shutdown_driver()
 
     print(f'\nEmail scrape done -- {success_email} success, {failed_email} failed\n')
 
