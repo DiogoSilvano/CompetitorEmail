@@ -45,8 +45,8 @@ HEADERS_LIST = [
 SESSION = requests.Session()
 
 # Cosine similarity threshold for TF-IDF deduplication.
-# 0.65 treats same story from different outlets as duplicate.
-SIMILARITY_THRESHOLD = 0.65
+# 0.80 focuses on near-identical stories and avoids same-sector false positives.
+SIMILARITY_THRESHOLD = 0.80
 
 # Shared Selenium driver — created once on first need, reused for all subsequent
 # Selenium fallbacks, and shut down in main()'s finally block.
@@ -536,22 +536,22 @@ def extract_entities(title):
     title = re.sub(r'[^\w\s]', ' ', title)
     entities = set()
     for w in title.split():
-        if len(w) >= 3 and w[0].isupper() and w.lower() not in stop:
+        if len(w) >= 4 and w[0].isupper() and w.lower() not in stop:
             entities.add(w.lower())
     return entities
 
 
 def _prompt_keep_article(stage_label, rss_title, match_row, match_title, detail):
     """Prompt the user to decide whether to keep a potential duplicate article.
-    Returns True to keep, False to remove. Defaults to remove on EOFError (non-interactive)."""
+    Returns True to keep, False to remove. Defaults to keep on EOFError (non-interactive)."""
     print(f'\n  ⚠  Potential duplicate [{stage_label} | {detail}]:')
     print(f'     RSS  : "{str(rss_title)[:80]}"')
     print(f'     Match: Row {match_row} -- "{str(match_title)[:80]}"')
     try:
-        answer = input('     Keep this article? [y/N]: ').strip().lower()
+        answer = input('     Remove as duplicate? [y/N]: ').strip().lower()
     except EOFError:
-        answer = ''   # non-interactive environment: default to remove
-    return answer in ('y', 'yes')
+        answer = 'n'   # non-interactive environment: default to keep
+    return answer not in ('y', 'yes')
 
 
 def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
@@ -643,7 +643,10 @@ def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
         rss_entities = extract_entities(rss_title)
         for db_idx, (db_title, db_entities) in enumerate(zip(db_titles, db_entity_sets)):
             shared = rss_entities & db_entities
-            if len(shared) < 2:
+            if len(shared) < 3:
+                continue
+            union = rss_entities | db_entities
+            if not union or (len(shared) / len(union)) < 0.20:
                 continue
             match_row   = db_idx + output_row_offset + 2
             match_title = db_titles[db_idx]
@@ -659,7 +662,7 @@ def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
                 entity_removed += 1
                 log_removal('Title entities', f'shared={sorted(list(shared)[:3])}',
                             rss_df.loc[orig_i], match_title, match_row)
-            break  # stop checking other db titles for this article
+                break  # stop checking other db titles only when removed
 
     print(f'  Stage 2 (Title entities): {entity_removed} removed\n')
 
