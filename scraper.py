@@ -11,16 +11,12 @@ from urllib.parse import urlparse
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
-import numpy as np
 import time
 import random
 import re
 import os
 import io
-import glob
 from datetime import datetime, timedelta
 
 HEADERS_LIST = [
@@ -43,10 +39,6 @@ HEADERS_LIST = [
 ]
 
 SESSION = requests.Session()
-
-# Cosine similarity threshold for TF-IDF deduplication.
-# 0.80 focuses on near-identical stories and avoids same-sector false positives.
-SIMILARITY_THRESHOLD = 0.80
 
 # Shared Selenium driver — created once on first need, reused for all subsequent
 # Selenium fallbacks, and shut down in main()'s finally block.
@@ -501,219 +493,6 @@ def scrape_article(url):
 
 
 # =============================================================================
-# RSS FILE LOADER
-# =============================================================================
-
-def load_rss_file(rss_folder):
-    """Load the most recently modified weekly RSS_Articles_W*.xlsx file."""
-    pattern = os.path.join(rss_folder, 'RSS_Articles_W*.xlsx')
-    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-    if not files:
-        print(f'INFO: No weekly RSS file found in: {rss_folder}')
-        return pd.DataFrame()
-    latest = files[0]
-    print(f'Loading RSS file: {os.path.basename(latest)}')
-    df = pd.read_excel(latest, engine='openpyxl')
-    print(f'  {len(df)} RSS articles loaded\n')
-    return df
-
-
-# =============================================================================
-# DEDUPLICATION
-# =============================================================================
-
-def extract_entities(title):
-    """
-    Extract capitalised words as a proxy for named entities (companies, brands, people).
-    Used for title-level same-story detection.
-    """
-    stop = {
-        'the','and','for','from','with','that','this','are','was','has','have',
-        'its','not','but','can','will','all','new','top','how','why','what',
-        'when','who','set','get','now','into','after','over','more','than',
-        'say','says','said','just','also','both','some','their','would',
-    }
-    title = re.sub(r'[^\w\s]', ' ', title)
-    entities = set()
-    for w in title.split():
-        if len(w) >= 4 and w[0].isupper() and w.lower() not in stop:
-            entities.add(w.lower())
-    return entities
-
-
-def _prompt_keep_article(stage_label, rss_title, match_row, match_title, detail):
-    """Prompt the user to decide whether to keep a potential duplicate article.
-    Returns True to keep, False to remove. Defaults to keep on EOFError (non-interactive)."""
-    print(f'\n  ⚠  Potential duplicate [{stage_label} | {detail}]:')
-    print(f'     RSS  : "{str(rss_title)[:80]}"')
-    print(f'     Match: Row {match_row} -- "{str(match_title)[:80]}"')
-    try:
-        answer = input('     Remove as duplicate? [y/N]: ').strip().lower()
-    except EOFError:
-        answer = 'n'   # non-interactive environment: default to keep
-    return answer not in ('y', 'yes')
-
-
-def deduplicate_rss_against_db(rss_df, db_df, output_row_offset):
-    """
-    Three-stage deduplication of RSS articles against the existing DB.
-
-    Stage 1 -- URL match: normalised URL comparison (strips query strings). Silent.
-    Stage 2 -- Title entity overlap: shared named entities in titles. Interactive.
-    Stage 3 -- TF-IDF cosine similarity on full article text. Interactive.
-
-    DB rows always win. The user is prompted before removing any Stage 2/3 matches.
-    Console output identifies each removed article and the matching DB row number.
-    """
-    if rss_df.empty:
-        return rss_df, []
-
-    removed_log = []
-    keep_mask   = pd.Series(True, index=rss_df.index)
-
-    # Build DB URL set
-    db_urls = set()
-    for col in ['NormalizedURL', 'ArticleURL']:
-        if col in db_df.columns:
-            db_urls.update(
-                normalise_url(u)
-                for u in db_df[col].dropna().astype(str)
-                if str(u).startswith('http')
-            )
-
-    db_df = db_df.copy()
-    db_df['_combined'] = (
-        db_df.get('Title', pd.Series(dtype=str)).fillna('') + ' ' +
-        db_df.get('Full_Article_Text', pd.Series(dtype=str)).fillna('')
-    ).str.strip()
-    db_df['_title'] = db_df.get('Title', pd.Series(dtype=str)).fillna('')
-    db_text_df = db_df[db_df['_combined'].str.len() > 50].reset_index(drop=True)
-
-    rss_df = rss_df.copy()
-    rss_df['_combined'] = (
-        rss_df.get('Title', pd.Series(dtype=str)).fillna('') + ' ' +
-        rss_df.get('Full_Article_Text', pd.Series(dtype=str)).fillna('')
-    ).str.strip()
-    rss_df['_title'] = rss_df.get('Title', pd.Series(dtype=str)).fillna('')
-
-    print('-' * 55)
-    print('DEDUPLICATION REPORT')
-    print('-' * 55)
-
-    def log_removal(stage, score, rss_row, match_title, match_row):
-        removed_log.append({
-            'stage': stage, 'score': score,
-            'rss_title': rss_row.get('Title', ''),
-            'rss_url':   rss_row.get('NormalizedURL', ''),
-            'match_title': match_title, 'match_row': match_row,
-        })
-        label = f'[{stage}]' if stage == 'URL match' else f'[{stage} {score}]'
-        print(f'  ❌ {label}  "{str(rss_row.get("Title", ""))[:60]}"')
-        print(f'           -> Matches row {match_row}: "{str(match_title)[:60]}"')
-
-    # ── Stage 1: URL match (silent) ────────────────────────────────────────
-    url_removed = 0
-    for i, row in rss_df.iterrows():
-        norm = normalise_url(row.get('NormalizedURL', '') or row.get('ArticleURL', ''))
-        if norm not in db_urls:
-            continue
-        keep_mask[i] = False
-        url_removed += 1
-        db_match = pd.DataFrame()
-        if 'NormalizedURL' in db_df.columns:
-            db_match = db_df[db_df['NormalizedURL'].apply(normalise_url) == norm]
-        if db_match.empty and 'ArticleURL' in db_df.columns:
-            db_match = db_df[db_df['ArticleURL'].apply(normalise_url) == norm]
-        match_row   = (db_match.index[0] + output_row_offset + 2) if not db_match.empty else '?'
-        match_title = db_match.iloc[0].get('Title', 'Unknown') if not db_match.empty else 'Unknown'
-        log_removal('URL match', 1.0, row, match_title, match_row)
-
-    print(f'\n  Stage 1 (URL): {url_removed} removed\n')
-
-    # ── Stage 2: Title entity overlap (interactive) ────────────────────────
-    remaining = [i for i in rss_df.index if keep_mask[i]]
-    entity_removed = 0
-
-    db_titles = db_text_df['_title'].tolist()
-    # Pre-compute entity sets for all DB titles once (avoids O(D×R) recomputation)
-    db_entity_sets = [extract_entities(t) for t in db_titles]
-
-    for orig_i in remaining:
-        rss_title = rss_df.at[orig_i, '_title']
-        rss_entities = extract_entities(rss_title)
-        for db_idx, (db_title, db_entities) in enumerate(zip(db_titles, db_entity_sets)):
-            shared = rss_entities & db_entities
-            if len(shared) < 3:
-                continue
-            union = rss_entities | db_entities
-            if not union or (len(shared) / len(union)) < 0.20:
-                continue
-            match_row   = db_idx + output_row_offset + 2
-            match_title = db_titles[db_idx]
-            keep = _prompt_keep_article(
-                stage_label='Title entities',
-                rss_title=rss_title,
-                match_row=match_row,
-                match_title=match_title,
-                detail=f'shared={sorted(shared)[:3]}',
-            )
-            if not keep:
-                keep_mask[orig_i] = False
-                entity_removed += 1
-                log_removal('Title entities', f'shared={sorted(list(shared)[:3])}',
-                            rss_df.loc[orig_i], match_title, match_row)
-                break  # stop checking other db titles only when removed
-
-    print(f'  Stage 2 (Title entities): {entity_removed} removed\n')
-
-    # ── Stage 3: TF-IDF full text (interactive) ───────────────────────────
-    remaining = [i for i in rss_df.index if keep_mask[i]]
-    tfidf_removed = 0
-
-    if remaining and not db_text_df.empty:
-        remaining_rss = rss_df.loc[remaining].reset_index(drop=True)
-        rss_texts = remaining_rss['_combined'].tolist()
-        db_texts  = db_text_df['_combined'].tolist()
-
-        vec    = TfidfVectorizer(max_features=5000, stop_words='english', ngram_range=(1, 2))
-        mat    = vec.fit_transform(db_texts + rss_texts)
-        scores = cosine_similarity(mat[len(db_texts):], mat[:len(db_texts)])
-
-        for j, orig_i in enumerate(remaining):
-            best_idx   = int(scores[j].argmax())
-            best_score = float(scores[j][best_idx])
-            if best_score < SIMILARITY_THRESHOLD:
-                continue
-            match_row   = best_idx + output_row_offset + 2
-            match_title = db_text_df.iloc[best_idx].get('Title', 'Unknown')
-            rss_title   = rss_df.at[orig_i, '_title']
-            keep = _prompt_keep_article(
-                stage_label='TF-IDF similarity',
-                rss_title=rss_title,
-                match_row=match_row,
-                match_title=match_title,
-                detail=f'score={best_score:.3f}',
-            )
-            if not keep:
-                keep_mask[orig_i] = False
-                tfidf_removed += 1
-                log_removal('TF-IDF', round(best_score, 3),
-                            rss_df.loc[orig_i], match_title, match_row)
-
-    print(f'  Stage 3 (TF-IDF): {tfidf_removed} removed\n')
-
-    unique_rss = rss_df[keep_mask].copy()
-    # Drop internal helper columns
-    for col in ['_combined', '_title']:
-        if col in unique_rss.columns:
-            unique_rss = unique_rss.drop(columns=[col])
-
-    print(f'  Total removed: {url_removed + entity_removed + tfidf_removed}')
-    print(f'  Unique kept  : {len(unique_rss)}')
-    print('-' * 55 + '\n')
-    return unique_rss, removed_log
-
-# =============================================================================
 # EXCEL WRITER
 # =============================================================================
 
@@ -775,7 +554,6 @@ def rewrite_excel_table(output_path, df):
 def main():
     DATA_DIR   = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\data'
     OUTPUT_DIR = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\output'
-    RSS_DIR    = r'C:\Users\dsn24\OneDrive - Sky\Diogo\Competitor Email Automation\Python Script\RSS Parser\output'
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -795,8 +573,7 @@ def main():
     print('=' * 55)
 
     # Always read Pending rows from the input file (Competitor_Email_DB.xlsx in /data).
-    # Power Automate writes new Pending rows there. The output file only holds
-    # already-processed rows and is used later for dedup comparison.
+    # Power Automate writes new Pending rows there.
     print(f'Reading from: {os.path.basename(input_file)}')
     try:
         df = pd.read_excel(input_file, sheet_name='Articles', engine='openpyxl')
@@ -860,86 +637,13 @@ def main():
     print(f'\nEmail scrape done -- {success_email} success, {failed_email} failed\n')
 
     # =========================================================================
-    # STEP 2: Load RSS file
+    # STEP 2: Build final output and save
     # =========================================================================
     print('=' * 55)
-    print('STEP 2: Loading RSS articles')
+    print('STEP 2: Writing output')
     print('=' * 55)
 
-    rss_df = load_rss_file(RSS_DIR)
-
-    # =========================================================================
-    # STEP 3: Deduplicate RSS against DB
-    # =========================================================================
-    print('=' * 55)
-    print('STEP 3: Deduplicating RSS against email DB')
-    print('=' * 55 + '\n')
-
-    try:
-        existing_output_df = pd.read_excel(
-            output_path, sheet_name='Articles', engine='openpyxl')
-    except Exception:
-        existing_output_df = pd.DataFrame()
-
-    newly_analysed = df[df['Status'] == 'Analysed'].copy()
-    db_for_dedup   = pd.concat(
-        [existing_output_df, newly_analysed], ignore_index=True
-    ) if not existing_output_df.empty else newly_analysed
-
-    if not rss_df.empty:
-        # Deduplicate within the RSS file itself first (same story across multiple pulls)
-        url_col_rss = 'NormalizedURL' if 'NormalizedURL' in rss_df.columns else 'ArticleURL'
-        before = len(rss_df)
-        rss_df = rss_df.drop_duplicates(subset=[url_col_rss], keep='first').reset_index(drop=True)
-        dupes_within = before - len(rss_df)
-        if dupes_within:
-            print(f'  Removed {dupes_within} duplicate URLs within RSS file\n')
-        unique_rss, removed_log = deduplicate_rss_against_db(
-            rss_df, db_for_dedup, len(existing_output_df))
-    else:
-        unique_rss, removed_log = pd.DataFrame(), []
-        print('No RSS articles to deduplicate\n')
-
-    # =========================================================================
-    # STEP 4: Build final output and save
-    # =========================================================================
-    print('=' * 55)
-    print('STEP 4: Writing output')
-    print('=' * 55)
-
-    db_columns = list(df.columns)
-    if not unique_rss.empty:
-        for col in db_columns:
-            if col not in unique_rss.columns:
-                unique_rss[col] = ''
-        unique_rss = unique_rss[db_columns]
-
-    # Combine all parts
-    parts     = [p for p in [existing_output_df, newly_analysed, unique_rss] if not p.empty]
-    output_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
-    # Final dedup pass: drop any duplicate URLs across the whole output.
-    # Priority: keep email DB rows (SourceEmail is empty or not 'RSS - ...') over RSS rows.
-    # Sort so email rows come first, then drop duplicate NormalizedURL keeping first.
-    if not output_df.empty:
-        def is_rss_row(source):
-            s = str(source).strip().lower()
-            return s.startswith('rss')
-
-        output_df['_is_rss'] = output_df.get('SourceEmail', pd.Series(dtype=str)).apply(is_rss_row)
-        # Sort: email rows (False) before RSS rows (True) so email wins on dedup
-        output_df = output_df.sort_values('_is_rss', ascending=True, kind='stable')
-        output_df = output_df.drop(columns=['_is_rss'])
-
-        # Dedup on NormalizedURL (covers both email and RSS rows)
-        url_col_out = 'NormalizedURL' if 'NormalizedURL' in output_df.columns else 'ArticleURL'
-        before = len(output_df)
-        output_df = output_df.drop_duplicates(subset=[url_col_out], keep='first')
-        dupes_removed = before - len(output_df)
-        if dupes_removed:
-            print(f'  Final dedup pass removed {dupes_removed} duplicate URL(s) from output')
-
-        output_df = output_df.reset_index(drop=True)
+    output_df = df[df['Status'] == 'Analysed'].copy().reset_index(drop=True)
 
     if 'EmailWeekEnding' not in output_df.columns:
         output_df['EmailWeekEnding'] = ''
@@ -958,17 +662,8 @@ def main():
     print('SUMMARY')
     print('=' * 55)
     print(f'Email scraped       : {success_email} OK, {failed_email} failed')
-    print(f'RSS unique added    : {len(unique_rss)}')
-    print(f'RSS duplicates out  : {len(removed_log)}')
     print(f'Total rows in file  : {len(output_df)}')
     print(f'Output              : {output_path}')
-
-    if removed_log:
-        print('\nRemoved RSS articles detail:')
-        for entry in removed_log:
-            print(f'  [{entry["stage"]} | score={entry["score"]}]')
-            print(f'    RSS  : {str(entry["rss_title"])[:70]}')
-            print(f'    Match: Row {entry["match_row"]} -- {str(entry["match_title"])[:70]}')
 
     input('\nPress Enter to exit...')
 
