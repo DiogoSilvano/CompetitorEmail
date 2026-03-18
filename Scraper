@@ -774,7 +774,9 @@ def main():
             df.at[i, 'SourceName']        = result['source_name']
             df.at[i, 'Status']            = 'Analysed'
             df.at[i, 'EmailWeekEnding']          = week_ending
-            df.at[i, 'DateScraped']       = scraped_date
+            existing_ds = row.get('DateScraped', '')
+            if pd.isna(existing_ds) or str(existing_ds).strip() == '':
+                df.at[i, 'DateScraped'] = scraped_date
             print(f'   OK [{result["method"]}] {str(result["title"])[:70]}')
             success_email += 1
         else:
