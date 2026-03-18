@@ -413,7 +413,6 @@ def main():
 
     if not rss_articles:
         print('ℹ️  No new RSS articles found')
-        input('\nPress Enter to exit...')
         return
 
     # ── Filter out URLs already in this week's file ───────────────────────────
@@ -424,7 +423,6 @@ def main():
 
     if not new_articles:
         print('ℹ️  All fetched articles already recorded this week.')
-        input('\nPress Enter to exit...')
         return
 
     # ── Scrape new articles ───────────────────────────────────────────────────
@@ -470,7 +468,6 @@ def main():
 
     if not rows:
         print('\n❌ No new articles successfully scraped')
-        input('\nPress Enter to exit...')
         return
 
     # ── Combine with existing rows and save ───────────────────────────────────
@@ -483,7 +480,6 @@ def main():
     print(f'❌ Failed         : {failed}')
     print(f'📦 Total in file  : {len(combined)}')
     print(f'📁 File           : {os.path.basename(output_path)}')
-    input('\nPress Enter to exit...')
 
 
 if __name__ == '__main__':

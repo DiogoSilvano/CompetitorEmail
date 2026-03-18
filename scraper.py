@@ -562,7 +562,6 @@ def main():
 
     if not os.path.exists(input_file):
         print(f'ERROR: File not found: {input_file}')
-        input('Press Enter to exit...')
         return
 
     # =========================================================================
@@ -666,8 +665,6 @@ def main():
     print(f'Email scraped       : {success_email} OK, {failed_email} failed')
     print(f'Total rows in file  : {len(output_df)}')
     print(f'Output              : {output_path}')
-
-    input('\nPress Enter to exit...')
 
 
 if __name__ == '__main__':
