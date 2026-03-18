@@ -837,6 +837,14 @@ def main():
     print('=' * 55)
 
     db_columns = list(df.columns)
+
+    # Ensure existing output only keeps current schema columns (drop old ones)
+    if not existing_output_df.empty:
+        for col in db_columns:
+            if col not in existing_output_df.columns:
+                existing_output_df[col] = ''
+        existing_output_df = existing_output_df[db_columns]
+
     if not unique_rss.empty:
         for col in db_columns:
             if col not in unique_rss.columns:
@@ -846,6 +854,10 @@ def main():
     # Combine all parts
     parts     = [p for p in [existing_output_df, newly_analysed, unique_rss] if not p.empty]
     output_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    # Keep only current schema columns, drop any stale columns
+    if not output_df.empty:
+        output_df = output_df[[c for c in db_columns if c in output_df.columns]]
 
     # Final dedup pass: drop any duplicate URLs across the whole output.
     # Priority: keep email DB rows (SourceEmail is empty or not 'RSS - ...') over RSS rows.
