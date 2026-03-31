@@ -655,6 +655,7 @@ def main():
     df['Status'] = df['Status'].astype(str).str.strip()
 
     pending = df[df['Status'] == 'Pending']
+    pending_indices = set(pending.index)
     success_email = failed_email = 0
     print(f'Pending rows: {len(pending)}\n')
 
@@ -699,7 +700,9 @@ def main():
     print('STEP 2: Writing output')
     print('=' * 55)
 
-    output_df = df[df['Status'] == 'Analysed'].copy().reset_index(drop=True)
+    # Output contains ONLY rows that were Pending at the start and successfully scraped
+    newly_analysed = df.index.isin(pending_indices) & (df['Status'] == 'Analysed')
+    output_df = df[newly_analysed].copy().reset_index(drop=True)
 
     if 'EmailWeekEnding' not in output_df.columns:
         output_df['EmailWeekEnding'] = ''
