@@ -548,6 +548,58 @@ def rewrite_excel_table(output_path, df):
         raise
 
 # =============================================================================
+# EXCEL REFRESH
+# =============================================================================
+
+def refresh_excel_file(file_path):
+    """Open the workbook invisibly via COM, refresh all data connections,
+    wait for async queries to finish, save, and close cleanly.
+    Requires pywin32 and a Windows Excel installation; degrades gracefully otherwise.
+    """
+    try:
+        import win32com.client
+    except ImportError:
+        print('WARNING: win32com.client not available — skipping Excel refresh.')
+        return
+
+    excel = None
+    wb    = None
+    try:
+        print('Refreshing Excel data connections...')
+        excel = win32com.client.Dispatch('Excel.Application')
+        excel.Visible       = False
+        excel.DisplayAlerts = False
+
+        wb = excel.Workbooks.Open(
+            file_path,
+            UpdateLinks=False,
+            ReadOnly=False,
+        )
+
+        wb.RefreshAll()
+        excel.CalculateUntilAsyncQueriesDone()  # blocks until all async queries finish
+        wb.Save()
+        print('Excel refresh complete.')
+
+    except Exception as exc:
+        print(f'WARNING: Excel refresh failed ({exc}) — continuing with existing data.')
+
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+        wb    = None
+        excel = None
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -564,6 +616,8 @@ def main():
         print(f'ERROR: File not found: {input_file}')
         input('Press Enter to exit...')
         return
+
+    refresh_excel_file(input_file)
 
     # =========================================================================
     # STEP 1: Scrape pending email links
