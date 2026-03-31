@@ -566,7 +566,7 @@ def refresh_excel_file(file_path):
     wb    = None
     try:
         print('Refreshing Excel data connections...')
-        excel = win32com.client.Dispatch('Excel.Application')
+        excel = win32com.client.DispatchEx('Excel.Application')
         excel.Visible       = False
         excel.DisplayAlerts = False
 
