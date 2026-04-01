@@ -558,6 +558,7 @@ def refresh_excel_file(file_path):
     """
     try:
         import win32com.client
+        import gc
     except ImportError:
         print('WARNING: win32com.client not available — skipping Excel refresh.')
         return
@@ -590,13 +591,14 @@ def refresh_excel_file(file_path):
                 wb.Close(SaveChanges=False)
         except Exception:
             pass
+        wb = None
         try:
             if excel is not None:
                 excel.Quit()
         except Exception:
             pass
-        wb    = None
         excel = None
+        gc.collect()  # force COM object release so Excel.exe exits and drops the file lock
 
 
 # =============================================================================
