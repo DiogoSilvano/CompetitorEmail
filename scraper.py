@@ -551,6 +551,18 @@ def rewrite_excel_table(output_path, df):
 # EXCEL REFRESH
 # =============================================================================
 
+def kill_excel_processes():
+    """Forcefully terminate any running Excel processes (Windows only).
+    Called before reading the input file to clear stale file locks."""
+    import subprocess
+    result = subprocess.run(
+        ['taskkill', '/F', '/IM', 'EXCEL.EXE'],
+        capture_output=True, text=True
+    )
+    if 'SUCCESS' in result.stdout:
+        print('Closed existing Excel process(es) before reading file.')
+
+
 def refresh_excel_file(file_path):
     """Open the workbook invisibly via COM, refresh all data connections,
     wait for async queries to finish, save, and close cleanly.
@@ -591,14 +603,23 @@ def refresh_excel_file(file_path):
                 wb.Close(SaveChanges=False)
         except Exception:
             pass
+        try:
+            del wb
+        except Exception:
+            pass
         wb = None
         try:
             if excel is not None:
                 excel.Quit()
         except Exception:
             pass
+        try:
+            del excel
+        except Exception:
+            pass
         excel = None
-        gc.collect()  # force COM object release so Excel.exe exits and drops the file lock
+        gc.collect()  # destroy COM wrappers so Excel.exe gets the exit signal
+        time.sleep(2)  # wait for Windows to release the file lock after Excel exits
 
 
 # =============================================================================
@@ -619,7 +640,9 @@ def main():
         input('Press Enter to exit...')
         return
 
+    kill_excel_processes()        # clear any stale Excel lock before refresh
     refresh_excel_file(input_file)
+    kill_excel_processes()        # ensure refresh Excel has fully exited before reading
 
     # =========================================================================
     # STEP 1: Scrape pending email links
