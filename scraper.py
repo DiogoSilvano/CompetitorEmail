@@ -507,10 +507,25 @@ def rewrite_excel_table(output_path, df):
     TABLE_NAME  = 'ArticlesTable'
     TABLE_STYLE = 'TableStyleMedium9'
 
-    import tempfile, shutil
+    import tempfile
 
     # ── Step 1: write clean data to a temp file ──────────────────────────────
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
+    # Create the temp file in the SAME directory as the output so os.replace()
+    # is guaranteed to be a single atomic operation on Windows. MoveFileEx
+    # only stays atomic on the same volume; cross-volume calls fall back to
+    # copy+delete and re-introduce the double-modify-event problem that
+    # causes Power Automate to fire its file-modified trigger twice.
+    #
+    # The "~$" prefix matches Office's lock-file naming convention, which
+    # OneDrive sync explicitly ignores, so the temp file does not generate
+    # any extra SharePoint revisions while it briefly exists.
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix='.xlsx',
+        prefix='~$tmp_Competitor_Email_DB_',
+        dir=output_dir,
+    )
     os.close(tmp_fd)
 
     try:
@@ -539,12 +554,21 @@ def rewrite_excel_table(output_path, df):
         wb.close()
 
         # ── Step 3: atomically replace the output file ────────────────────────
-        shutil.move(tmp_path, output_path)
+        # os.replace() uses MoveFileEx with REPLACE_EXISTING on Windows and
+        # produces a SINGLE filesystem modify notification, so OneDrive
+        # uploads one revision and Power Automate fires its trigger exactly
+        # once per run. shutil.move() previously fell back to copy2 (when
+        # the destination existed), which produced two events (content
+        # write + metadata update) and caused the trigger to fire twice.
+        os.replace(tmp_path, output_path)
         print(f'Written {n_rows} rows to {os.path.basename(output_path)}')
 
     except Exception:
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
         raise
 
 # =============================================================================
